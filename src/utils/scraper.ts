@@ -1,113 +1,39 @@
 import type { ScrapedData } from "../types";
 
-/**
- * Client-side link parser that extracts Open Graph and meta tags from URLs.
- * For a production app, this would be a backend service using Puppeteer/Playwright.
- * This implementation uses a CORS proxy approach for demo purposes.
- */
+const API_BASE = "http://localhost:3001";
 
 function extractDomain(url: string): string {
   try {
-    const hostname = new URL(url).hostname;
-    return hostname.replace("www.", "");
+    return new URL(url).hostname.replace("www.", "");
   } catch {
     return "Unknown";
   }
 }
 
-function extractFromHtml(html: string, url: string): ScrapedData {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(html, "text/html");
-
-  const getMeta = (property: string): string => {
-    const el =
-      doc.querySelector(`meta[property="${property}"]`) ||
-      doc.querySelector(`meta[name="${property}"]`);
-    return el?.getAttribute("content") || "";
-  };
-
-  const title =
-    getMeta("og:title") ||
-    getMeta("twitter:title") ||
-    doc.querySelector("title")?.textContent ||
-    "Untitled Item";
-
-  const imageUrl =
-    getMeta("og:image") ||
-    getMeta("twitter:image") ||
-    doc.querySelector('link[rel="image_src"]')?.getAttribute("href") ||
-    "";
-
-  const description =
-    getMeta("og:description") ||
-    getMeta("description") ||
-    getMeta("twitter:description") ||
-    "";
-
-  // Try to extract price from structured data or common patterns
-  let price = "";
-  const pricePatterns = [
-    /\$[\d,]+\.?\d*/,
-    /€[\d,]+\.?\d*/,
-    /£[\d,]+\.?\d*/,
-    /USD\s*[\d,]+\.?\d*/,
-    /EUR\s*[\d,]+\.?\d*/,
-  ];
-
-  const jsonLdScripts = doc.querySelectorAll(
-    'script[type="application/ld+json"]'
-  );
-  for (const script of jsonLdScripts) {
-    try {
-      const data = JSON.parse(script.textContent || "");
-      if (data.offers?.price) {
-        price = String(data.offers.price);
-        break;
-      }
-      if (data["@graph"]) {
-        for (const item of data["@graph"]) {
-          if (item.offers?.price) {
-            price = String(item.offers.price);
-            break;
-          }
-        }
-      }
-    } catch {
-      // ignore JSON parse errors
-    }
-  }
-
-  if (!price) {
-    const bodyText = doc.body?.textContent || "";
-    for (const pattern of pricePatterns) {
-      const match = bodyText.match(pattern);
-      if (match) {
-        price = match[0];
-        break;
-      }
-    }
-  }
-
-  const currency = price.startsWith("€")
-    ? "EUR"
-    : price.startsWith("£")
-      ? "GBP"
-      : "USD";
-
-  return {
-    title: title.trim(),
-    price: price || "Price not found",
-    currency,
-    imageUrl,
-    store: extractDomain(url),
-    sizes: [],
-    colors: [],
-    description: description.trim(),
-  };
-}
-
 export async function scrapeUrl(url: string): Promise<ScrapedData> {
-  // Try fetching via a CORS proxy for client-side scraping
+  // Try the backend API first (server-side scraping, no CORS issues)
+  try {
+    const response = await fetch(`${API_BASE}/api/scrape`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+      signal: AbortSignal.timeout(20000),
+    });
+
+    if (response.ok) {
+      return await response.json();
+    }
+
+    // If server returned an error with a fallback, use it
+    const errorData = await response.json().catch(() => null);
+    if (errorData?.fallback) {
+      return errorData.fallback;
+    }
+  } catch {
+    // Backend not available, fall through to client-side attempt
+  }
+
+  // Fallback: try client-side CORS proxies
   const corsProxies = [
     `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
     `https://corsproxy.io/?${encodeURIComponent(url)}`,
@@ -127,7 +53,7 @@ export async function scrapeUrl(url: string): Promise<ScrapedData> {
     }
   }
 
-  // Fallback: return basic data from the URL itself
+  // Final fallback
   return {
     title: extractDomain(url) + " Item",
     price: "Price not found",
@@ -140,9 +66,91 @@ export async function scrapeUrl(url: string): Promise<ScrapedData> {
   };
 }
 
-/**
- * Create a manual item when URL scraping isn't needed
- */
+/** Client-side HTML extraction fallback */
+function extractFromHtml(html: string, url: string): ScrapedData {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, "text/html");
+
+  const getMeta = (property: string): string => {
+    const el =
+      doc.querySelector(`meta[property="${property}"]`) ||
+      doc.querySelector(`meta[name="${property}"]`);
+    return el?.getAttribute("content") || "";
+  };
+
+  const title =
+    getMeta("og:title") ||
+    getMeta("twitter:title") ||
+    doc.querySelector("title")?.textContent ||
+    "Untitled Item";
+
+  const imageUrl =
+    getMeta("og:image") ||
+    getMeta("og:image:secure_url") ||
+    getMeta("twitter:image") ||
+    "";
+
+  const description =
+    getMeta("og:description") ||
+    getMeta("description") ||
+    "";
+
+  // Price extraction
+  let price = "";
+  let currency = "USD";
+
+  // Try product meta tags
+  const metaPrice =
+    getMeta("product:price:amount") || getMeta("og:price:amount") || "";
+  if (metaPrice) {
+    price = metaPrice;
+    currency = getMeta("product:price:currency") || "USD";
+  }
+
+  // Try JSON-LD
+  if (!price) {
+    const jsonLdScripts = doc.querySelectorAll('script[type="application/ld+json"]');
+    for (const script of jsonLdScripts) {
+      try {
+        const data = JSON.parse(script.textContent || "");
+        if (data.offers?.price) {
+          price = String(data.offers.price);
+          currency = data.offers?.priceCurrency || currency;
+          break;
+        }
+        if (data["@graph"]) {
+          for (const item of data["@graph"]) {
+            if (item.offers?.price) {
+              price = String(item.offers.price);
+              currency = item.offers?.priceCurrency || currency;
+              break;
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  // Format price with currency symbol
+  if (price && !price.match(/[\$\€\£\₹]/)) {
+    const symbols: Record<string, string> = { USD: "$", EUR: "€", GBP: "£", INR: "₹" };
+    price = (symbols[currency] || currency + " ") + price;
+  }
+
+  return {
+    title: title.trim(),
+    price: price || "Price not found",
+    currency,
+    imageUrl,
+    store: extractDomain(url),
+    sizes: [],
+    colors: [],
+    description: description.trim(),
+  };
+}
+
 export function createManualItem(
   title: string,
   imageUrl: string,
